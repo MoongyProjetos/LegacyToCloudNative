@@ -1,0 +1,88 @@
+trigger:
+  branches:
+    include:
+      - main
+
+# Opcional: rodar PR validation
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  # Ajuste para o seu contexto
+  azureServiceConnection: 'sc-azure-moongy'
+  resourceGroupName: 'rg-moongy-demo'
+  location: 'westeurope'
+
+  # Nome da app (o bicep usa default, mas aqui deixamos explícito)
+  webAppName: 'MoongyWebApp'
+
+  # Caminho do bicep no repo
+  bicepFile: 'main.bicep'
+
+  # Deployment name (fica bom pra rastrear no RG)
+  deploymentName:: 'moongy-$(Build.SourceBranchName)-$(Build.BuildId)'
+
+stages:
+- stage: Deploy
+  displayName: 'Deploy Infra (Bicep)'
+  jobs:
+  - job: DeployBicep
+    displayName: 'Deploy Bicep to Azure'
+    pool:
+      vmImage: 'ubuntu-latest'
+
+    steps:
+    - checkout: self
+
+    - task: AzureCLI@2
+      displayName: 'Validate Bicep (compile)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+          echo "Azure CLI version:"
+          az version
+
+          echo "Compiling Bicep -> ARM JSON (validation step)"
+          az bicep version
+          az bicep build --file "$(bicepFile)"
+
+    - task: AzureCLI@2
+      displayName: 'Deploy Resource Group (az deployment group create)'
+      inputs:
+        azureSubscription: '$(azureServiceConnection)'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          set -euo pipefail
+
+          echo "Deploying to RG: $(resourceGroupName) in $(location)"
+          echo "Deployment name: $(deploymentName)"
+          
+          az group show -n "$(resourceGroupName)" >/dev/null 2>&1 || {
+            echo "ERROR: Resource Group '$(resourceGroupName)' not found."
+            echo "Create it first or add a step to create it."
+            exit 1
+          }
+
+          az deployment group create \
+            --name "$(deploymentName)" \
+            --resource-group "$(resourceGroupName)" \
+            --template-file "$(bicepFile)" \
+            --parameters \
+              location="$(location)" \
+              webAppName="$(webAppName)" \
+              sqlAdminLogin="$(SQL_ADMIN_LOGIN)" \
+              sqlAdminPassword="$(SQL_ADMIN_PASSWORD)" \
+            --only-show-errors
+
+      env:
+        # Defina essas variáveis no Pipeline/Variable Group:
+        # - SQL_ADMIN_LOGIN (normal)
+        # - SQL_ADMIN_PASSWORD (secret)
+        SQL_ADMIN_LOGIN: $(SQL_ADMIN_LOGIN)
+        SQL_ADMIN_PASSWORD: $(SQL_ADMIN_PASSWORD)

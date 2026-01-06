@@ -1,0 +1,210 @@
+trigger:
+  branches:
+    include:
+      - main
+
+pr:
+  branches:
+    include:
+      - main
+
+variables:
+  azureServiceConnection: 'sc-azure-moongy'
+  resourceGroupName: 'rg-moongy-demo'
+  location: 'westeurope'
+
+  # Infra
+  bicepFile: 'infra/main.bicep'
+  deploymentName: 'moongy-$(Build.SourceBranchName)-$(Build.BuildId)'
+
+  # App
+  webAppName: 'MoongyWebApp'
+  appProject: 'src/MoongyWebApp/MoongyWebApp.csproj'
+  buildConfiguration: 'Release'
+
+  # DB (DACPAC)
+  # Ajuste para o caminho do seu .sqlproj (SQL Database Project)
+  sqlProj: 'src/Moongy.Database/Moongy.Database.sqlproj'
+  dacpacName: 'Moongy.Database.dacpac'
+
+stages:
+# ============================================================
+# STAGE 1: BUILD
+# ============================================================
+- stage: Build
+  displayName: 'Build (WebApp + DB)'
+  jobs:
+  - job: Build
+    displayName: 'Build artifacts'
+    pool:
+      vmImage: 'windows-latest' # recomendado para compilar .sqlproj (SSDT)
+
+    steps:
+    - checkout: self
+
+    # ---------
+    # Build WebApp (.NET 8)
+    # ---------
+    - task: UseDotNet@2
+      displayName: 'Use .NET SDK 8'
+      inputs:
+        packageType: 'sdk'
+        version: '8.x'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Restore WebApp'
+      inputs:
+        command: 'restore'
+        projects: '$(appProject)'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Build WebApp'
+      inputs:
+        command: 'build'
+        projects: '$(appProject)'
+        arguments: '--configuration $(buildConfiguration) --no-restore'
+
+    - task: DotNetCoreCLI@2
+      displayName: 'Publish WebApp (zip)'
+      inputs:
+        command: 'publish'
+        publishWebProjects: false
+        projects: '$(appProject)'
+        arguments: '--configuration $(buildConfiguration) --output $(Build.ArtifactStagingDirectory)/webapp'
+        zipAfterPublish: true
+
+    # ---------
+    # Build DB (DACPAC) - recomendado para tabelas/views/procs
+    # ---------
+    - task: VSBuild@1
+      displayName: 'Build SQL Project (DACPAC)'
+      inputs:
+        solution: '$(sqlProj)'
+        msbuildArgs: '/p:Configuration=$(buildConfiguration)'
+        platform: 'Any CPU'
+        configuration: '$(buildConfiguration)'
+
+    # Copia o dacpac para a pasta de artifacts
+    - powershell: |
+        $dacpac = Get-ChildItem -Recurse -Filter "$(dacpacName)" "$(Build.SourcesDirectory)" | Select-Object -First 1
+        if (-not $dacpac) {
+          Write-Error "DACPAC $(dacpacName) não encontrado. Verifique o nome/saída do projeto SQL."
+        }
+        New-Item -ItemType Directory -Force -Path "$(Build.ArtifactStagingDirectory)\db" | Out-Null
+        Copy-Item $dacpac.FullName "$(Build.ArtifactStagingDirectory)\db\$(dacpacName)" -Force
+        Write-Host "DACPAC copiado: $(Build.ArtifactStagingDirectory)\db\$(dacpacName)"
+      displayName: 'Copy DACPAC to artifacts'
+
+    # Publica artifacts
+    - publish: '$(Build.ArtifactStagingDirectory)'
+      artifact: drop
+      displayName: 'Publish artifacts'
+
+
+# ============================================================
+# STAGE 2: DEPLOY
+# ============================================================
+- stage: Deploy
+  displayName: 'Deploy (Infra + DB + WebApp)'
+  dependsOn: Build
+  jobs:
+  - deployment: Deploy
+    displayName: 'Deploy to Azure'
+    environment: 'dev'  # se quiser approvals, cria environments dev/stg/prod
+    pool:
+      vmImage: 'windows-latest'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: current
+            artifact: drop
+            displayName: 'Download build artifacts'
+
+          # --------------------
+          # 1) Provisionar Infra via Bicep
+          # --------------------
+          - task: AzureCLI@2
+            displayName: 'Provision Infra (Bicep)'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              scriptType: 'ps'
+              scriptLocation: 'inlineScript'
+              inlineScript: |
+                $ErrorActionPreference = "Stop"
+
+                az bicep build --file "$(Build.SourcesDirectory)\$(bicepFile)" | Out-Null
+
+                # garante RG (opcional, mas útil)
+                az group create -n "$(resourceGroupName)" -l "$(location)" --only-show-errors | Out-Null
+
+                # deploy
+                az deployment group create `
+                  --name "$(deploymentName)" `
+                  --resource-group "$(resourceGroupName)" `
+                  --template-file "$(Build.SourcesDirectory)\$(bicepFile)" `
+                  --parameters `
+                    location="$(location)" `
+                    webAppName="$(webAppName)" `
+                    sqlAdminLogin="$(SQL_ADMIN_LOGIN)" `
+                    sqlAdminPassword="$(SQL_ADMIN_PASSWORD)" `
+                  --only-show-errors | Out-Null
+
+                # captura outputs para usar no deploy do DB (FQDN do SQL)
+                $out = az deployment group show --resource-group "$(resourceGroupName)" --name "$(deploymentName)" --query "properties.outputs" -o json | ConvertFrom-Json
+                $sqlFqdn = $out.sqlServerFqdn.value
+                Write-Host "SQL FQDN: $sqlFqdn"
+
+                # variável de pipeline para os próximos steps
+                Write-Host "##vso[task.setvariable variable=SQL_SERVER_FQDN;isOutput=false]$sqlFqdn"
+            env:
+              SQL_ADMIN_LOGIN: $(SQL_ADMIN_LOGIN)
+              SQL_ADMIN_PASSWORD: $(SQL_ADMIN_PASSWORD)
+
+          # --------------------
+          # 2) Deploy do Banco (DACPAC)
+          # --------------------
+          - task: SqlAzureDacpacDeployment@1
+            displayName: 'Deploy DB schema (DACPAC)'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              AuthenticationType: 'server'
+              ServerName: '$(SQL_SERVER_FQDN)'
+              DatabaseName: '$(webAppName)-db'
+              SqlUsername: '$(SQL_ADMIN_LOGIN)'
+              SqlPassword: '$(SQL_ADMIN_PASSWORD)'
+              deployType: 'DacpacTask'
+              DeploymentAction: 'Publish'
+              DacpacFile: '$(Pipeline.Workspace)\drop\db\$(dacpacName)'
+              AdditionalArguments: >
+                /p:BlockOnPossibleDataLoss=false
+                /p:CommandTimeout=1200
+
+          # --------------------
+          # 3) Deploy da WebApp (.NET 8) no App Service
+          # --------------------
+          - task: AzureWebApp@1
+            displayName: 'Deploy WebApp (zip)'
+            inputs:
+              azureSubscription: '$(azureServiceConnection)'
+              appType: 'webApp'
+              appName: '$(webAppName)'
+              package: '$(Pipeline.Workspace)\drop\webapp\*.zip'
+
+          # --------------------
+          # 4) (Opcional) Setar connection string via App Settings
+          #     - se você preferir controlar no pipeline ao invés do Bicep
+          # --------------------
+          # - task: AzureAppServiceSettings@1
+          #   displayName: 'Configure App Settings (optional)'
+          #   inputs:
+          #     azureSubscription: '$(azureServiceConnection)'
+          #     appName: '$(webAppName)'
+          #     resourceGroupName: '$(resourceGroupName)'
+          #     appSettings: |
+          #       [
+          #         {"name":"ASPNETCORE_ENVIRONMENT","value":"Production","slotSetting":false}
+          #       ]
+            # env:
+            #   SQL_ADMIN_LOGIN: $(SQL_ADMIN_LOGIN)
+            #   SQL_ADMIN_PASSWORD: $(SQL_ADMIN_PASSWORD)
