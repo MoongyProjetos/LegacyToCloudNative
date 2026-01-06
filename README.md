@@ -71,3 +71,7 @@ O foco está em **estratégia, arquitetura e boas práticas**, equilibrando **be
 
 > Cloud-native não é sobre tecnologia nova.
 > É sobre **reduzir risco, aumentar velocidade e evoluir com segurança**.
+
+
+---
+Moongy 2026 - Todos os direitos reservados
